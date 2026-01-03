@@ -32,14 +32,15 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x, cache_x=None):
+        # x: (B, C, T, H, W) | cache_x: (B, C, CACHE_T, H, W) or None
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
+            x = torch.cat([cache_x, x], dim=2)  # x: (B, C, T+CACHE_T, H, W)
             padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        x = F.pad(x, padding)  # x: (B, C, T+padding, H+padding, W+padding)
 
-        return super().forward(x)
+        return super().forward(x)  # -> (B, C_out, T_out, H_out, W_out)
 
 
 class RMS_norm(nn.Module):
@@ -55,8 +56,9 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
+        # x: (B, C, T, H, W) or (B, C, H, W) if channel_first else (B, T, H, W, C) or (B, H, W, C)
         return (F.normalize(x, dim=(1 if self.channel_first else -1)) *
-                self.scale * self.gamma + self.bias)
+                self.scale * self.gamma + self.bias)  # -> same shape as input
 
 
 class Upsample(nn.Upsample):
@@ -65,7 +67,8 @@ class Upsample(nn.Upsample):
         """
         Fix bfloat16 support for nearest neighbor interpolation.
         """
-        return super().forward(x.float()).type_as(x)
+        # x: (B, C, H, W) or (B, C, T, H, W)
+        return super().forward(x.float()).type_as(x)  # -> (B, C, H*scale, W*scale) or (B, C, T, H*scale, W*scale)
 
 
 class Resample(nn.Module):
@@ -110,6 +113,7 @@ class Resample(nn.Module):
             self.resample = nn.Identity()
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # x: (B, C, T, H, W)
         b, c, t, h, w = x.size()
         if self.mode == "upsample3d":
             if feat_cache is not None:
@@ -150,9 +154,9 @@ class Resample(nn.Module):
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
-        x = rearrange(x, "b c t h w -> (b t) c h w")
-        x = self.resample(x)
-        x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
+        x = rearrange(x, "b c t h w -> (b t) c h w")  # x: (B*T, C, H, W) or (B*T*2, C, H, W) if upsample3d
+        x = self.resample(x)  # x: (B*T, C, H', W') where H'=H*2 or H/2 depending on mode
+        x = rearrange(x, "(b t) c h w -> b c t h w", t=t)  # x: (B, C, T, H', W') or (B, C, T*2, H', W') if upsample3d
 
         if self.mode == "downsample3d":
             if feat_cache is not None:
@@ -163,10 +167,10 @@ class Resample(nn.Module):
                 else:
                     cache_x = x[:, :, -1:, :, :].clone()
                     x = self.time_conv(
-                        torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
+                        torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))  # x: (B, C, T/2, H', W')
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
-        return x
+        return x  # -> (B, C, T', H', W') where T'=T*2 or T/2, H'=H*2 or H/2, W'=W*2 or W/2 depending on mode
 
     def init_weight(self, conv):
         conv_weight = conv.weight.detach().clone()
@@ -212,7 +216,8 @@ class ResidualBlock(nn.Module):
             if in_dim != out_dim else nn.Identity())
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
-        h = self.shortcut(x)
+        # x: (B, C_in, T, H, W)
+        h = self.shortcut(x)  # h: (B, C_out, T, H, W)
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
@@ -231,8 +236,8 @@ class ResidualBlock(nn.Module):
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
             else:
-                x = layer(x)
-        return x + h
+                x = layer(x)  # x: (B, C_out, T, H, W) after final conv
+        return x + h  # -> (B, C_out, T, H, W)
 
 
 class AttentionBlock(nn.Module):
@@ -253,43 +258,45 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
+        # x: (B, C, T, H, W)
         identity = x
         b, c, t, h, w = x.size()
-        x = rearrange(x, "b c t h w -> (b t) c h w")
-        x = self.norm(x)
+        x = rearrange(x, "b c t h w -> (b t) c h w")  # x: (B*T, C, H, W)
+        x = self.norm(x)  # x: (B*T, C, H, W)
         # compute query, key, value
         q, k, v = (
             self.to_qkv(x).reshape(b * t, 1, c * 3,
                                    -1).permute(0, 1, 3,
-                                               2).contiguous().chunk(3, dim=-1))
+                                               2).contiguous().chunk(3, dim=-1))  # q,k,v: (B*T, 1, H*W, C)
 
         # apply attention
         x = F.scaled_dot_product_attention(
             q,
             k,
             v,
-        )
-        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+        )  # x: (B*T, 1, H*W, C)
+        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)  # x: (B*T, C, H, W)
 
         # output
-        x = self.proj(x)
-        x = rearrange(x, "(b t) c h w-> b c t h w", t=t)
-        return x + identity
+        x = self.proj(x)  # x: (B*T, C, H, W)
+        x = rearrange(x, "(b t) c h w-> b c t h w", t=t)  # x: (B, C, T, H, W)
+        return x + identity  # -> (B, C, T, H, W)
 
 
 def patchify(x, patch_size):
+    # x: (B, C, H, W) or (B, C, T, H, W)
     if patch_size == 1:
-        return x
+        return x  # -> same shape as input
     if x.dim() == 4:
         x = rearrange(
-            x, "b c (h q) (w r) -> b (c r q) h w", q=patch_size, r=patch_size)
+            x, "b c (h q) (w r) -> b (c r q) h w", q=patch_size, r=patch_size)  # x: (B, C*patch_size^2, H/patch_size, W/patch_size)
     elif x.dim() == 5:
         x = rearrange(
             x,
             "b c f (h q) (w r) -> b (c r q) f h w",
             q=patch_size,
             r=patch_size,
-        )
+        )  # x: (B, C*patch_size^2, T, H/patch_size, W/patch_size)
     else:
         raise ValueError(f"Invalid input shape: {x.shape}")
 
@@ -297,19 +304,20 @@ def patchify(x, patch_size):
 
 
 def unpatchify(x, patch_size):
+    # x: (B, C*patch_size^2, H, W) or (B, C*patch_size^2, T, H, W)
     if patch_size == 1:
-        return x
+        return x  # -> same shape as input
 
     if x.dim() == 4:
         x = rearrange(
-            x, "b (c r q) h w -> b c (h q) (w r)", q=patch_size, r=patch_size)
+            x, "b (c r q) h w -> b c (h q) (w r)", q=patch_size, r=patch_size)  # x: (B, C, H*patch_size, W*patch_size)
     elif x.dim() == 5:
         x = rearrange(
             x,
             "b (c r q) f h w -> b c f (h q) (w r)",
             q=patch_size,
             r=patch_size,
-        )
+        )  # x: (B, C, T, H*patch_size, W*patch_size)
     return x
 
 
@@ -333,9 +341,10 @@ class AvgDown3D(nn.Module):
         self.group_size = in_channels * self.factor // out_channels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C_in, T, H, W)
         pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
         pad = (0, 0, 0, 0, pad_t, 0)
-        x = F.pad(x, pad)
+        x = F.pad(x, pad)  # x: (B, C_in, T+pad_t, H, W)
         B, C, T, H, W = x.shape
         x = x.view(
             B,
@@ -362,9 +371,9 @@ class AvgDown3D(nn.Module):
             T // self.factor_t,
             H // self.factor_s,
             W // self.factor_s,
-        )
-        x = x.mean(dim=2)
-        return x
+        )  # x: (B, C_out, group_size, T/factor_t, H/factor_s, W/factor_s)
+        x = x.mean(dim=2)  # x: (B, C_out, T/factor_t, H/factor_s, W/factor_s)
+        return x  # -> (B, C_out, T/factor_t, H/factor_s, W/factor_s)
 
 
 class DupUp3D(nn.Module):
@@ -388,7 +397,8 @@ class DupUp3D(nn.Module):
         self.repeats = out_channels * self.factor // in_channels
 
     def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
-        x = x.repeat_interleave(self.repeats, dim=1)
+        # x: (B, C_in, T, H, W)
+        x = x.repeat_interleave(self.repeats, dim=1)  # x: (B, C_in*repeats, T, H, W)
         x = x.view(
             x.size(0),
             self.out_channels,
@@ -398,18 +408,18 @@ class DupUp3D(nn.Module):
             x.size(2),
             x.size(3),
             x.size(4),
-        )
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
+        )  # x: (B, C_out, factor_t, factor_s, factor_s, T, H, W)
+        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()  # x: (B, C_out, T, factor_t, H, factor_s, W, factor_s)
         x = x.view(
             x.size(0),
             self.out_channels,
             x.size(2) * self.factor_t,
             x.size(4) * self.factor_s,
             x.size(6) * self.factor_s,
-        )
+        )  # x: (B, C_out, T*factor_t, H*factor_s, W*factor_s)
         if first_chunk:
-            x = x[:, :, self.factor_t - 1:, :, :]
-        return x
+            x = x[:, :, self.factor_t - 1:, :, :]  # x: (B, C_out, T*factor_t-(factor_t-1), H*factor_s, W*factor_s)
+        return x  # -> (B, C_out, T*factor_t, H*factor_s, W*factor_s) or (B, C_out, T*factor_t-(factor_t-1), H*factor_s, W*factor_s)
 
 
 class Down_ResidualBlock(nn.Module):
@@ -445,11 +455,12 @@ class Down_ResidualBlock(nn.Module):
         self.downsamples = nn.Sequential(*downsamples)
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # x: (B, C_in, T, H, W)
         x_copy = x.clone()
         for module in self.downsamples:
-            x = module(x, feat_cache, feat_idx)
+            x = module(x, feat_cache, feat_idx)  # x: (B, C_out, T', H', W') where T'=T or T/2, H'=H or H/2, W'=W or W/2
 
-        return x + self.avg_shortcut(x_copy)
+        return x + self.avg_shortcut(x_copy)  # -> (B, C_out, T', H', W')
 
 
 class Up_ResidualBlock(nn.Module):
@@ -487,14 +498,15 @@ class Up_ResidualBlock(nn.Module):
         self.upsamples = nn.Sequential(*upsamples)
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        # x: (B, C_in, T, H, W)
         x_main = x.clone()
         for module in self.upsamples:
-            x_main = module(x_main, feat_cache, feat_idx)
+            x_main = module(x_main, feat_cache, feat_idx)  # x_main: (B, C_out, T', H', W') where T'=T or T*2, H'=H or H*2, W'=W or W*2
         if self.avg_shortcut is not None:
-            x_shortcut = self.avg_shortcut(x, first_chunk)
-            return x_main + x_shortcut
+            x_shortcut = self.avg_shortcut(x, first_chunk)  # x_shortcut: (B, C_out, T', H', W')
+            return x_main + x_shortcut  # -> (B, C_out, T', H', W')
         else:
-            return x_main
+            return x_main  # -> (B, C_out, T', H', W')
 
 
 class Encoder3d(nn.Module):
@@ -557,6 +569,8 @@ class Encoder3d(nn.Module):
         )
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # x: (B, 12, T, H, W) - 12 channels from patchified 3-channel video (patch_size=2: 3*2*2=12)
+        # Returns: (B, z_dim, T/4, H/8, W/8) or (B, z_dim, T/8, H/8, W/8) depending on temperal_downsample
 
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -610,7 +624,7 @@ class Encoder3d(nn.Module):
             else:
                 x = layer(x)
 
-        return x
+        return x  # -> (B, z_dim, T/4, H/8, W/8) or (B, z_dim, T/8, H/8, W/8)
 
 
 class Decoder3d(nn.Module):
@@ -670,6 +684,9 @@ class Decoder3d(nn.Module):
         )
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        # x: (B, z_dim, T, H, W) - latent representation
+        # Returns: (B, 12, T', H*8, W*8) where T'=T*4 or T*8 depending on temperal_upsample
+
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -720,7 +737,7 @@ class Decoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
-        return x
+        return x  # -> (B, 12, T', H*8, W*8) where T' depends on temperal_upsample configuration
 
 
 def count_conv3d(model):
@@ -776,13 +793,16 @@ class WanVAE_(nn.Module):
         )
 
     def forward(self, x, scale=[0, 1]):
-        mu = self.encode(x, scale)
-        x_recon = self.decode(mu, scale)
-        return x_recon, mu
+        # x: (B, C, T, H, W) - input video (C=3 for RGB)
+        mu = self.encode(x, scale)  # mu: (B, z_dim, T', H', W')
+        x_recon = self.decode(mu, scale)  # x_recon: (B, C, T, H, W)
+        return x_recon, mu  # -> ((B, C, T, H, W), (B, z_dim, T', H', W'))
 
     def encode(self, x, scale):
+        # x: (B, C, T, H, W) - input video (C=3 for RGB)
+        # Returns: (B, z_dim, T', H/16, W/16) where T'=ceil(T/4) or ceil(T/8)
         self.clear_cache()
-        x = patchify(x, patch_size=2)
+        x = patchify(x, patch_size=2)  # x: (B, 12, T, H/2, W/2)
         t = x.shape[2]
         iter_ = 1 + (t - 1) // 4
         for i in range(iter_):
@@ -798,26 +818,28 @@ class WanVAE_(nn.Module):
                     x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                     feat_cache=self._enc_feat_map,
                     feat_idx=self._enc_conv_idx,
-                )
-                out = torch.cat([out, out_], 2)
-        mu, log_var = self.conv1(out).chunk(2, dim=1)
+                )  # out_: (B, z_dim*2, 4, H/16, W/16)
+                out = torch.cat([out, out_], 2)  # out: (B, z_dim*2, T', H/16, W/16)
+        mu, log_var = self.conv1(out).chunk(2, dim=1)  # mu, log_var: (B, z_dim, T', H/16, W/16)
         if isinstance(scale[0], torch.Tensor):
             mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
                 1, self.z_dim, 1, 1, 1)
         else:
-            mu = (mu - scale[0]) * scale[1]
+            mu = (mu - scale[0]) * scale[1]  # mu: (B, z_dim, T', H/16, W/16) - normalized
         self.clear_cache()
-        return mu
+        return mu  # -> (B, z_dim, T', H/16, W/16)
 
     def decode(self, z, scale):
+        # z: (B, z_dim, T', H', W') - latent representation
+        # Returns: (B, C, T, H, W) - reconstructed video
         self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
-            z = z / scale[1] + scale[0]
+            z = z / scale[1] + scale[0]  # z: (B, z_dim, T', H', W') - denormalized
         iter_ = z.shape[2]
-        x = self.conv2(z)
+        x = self.conv2(z)  # x: (B, z_dim, T', H', W')
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
@@ -832,11 +854,11 @@ class WanVAE_(nn.Module):
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
-                )
-                out = torch.cat([out, out_], 2)
-        out = unpatchify(out, patch_size=2)
+                )  # out_: (B, 12, T_chunk*4 or T_chunk*8, H*8, W*8)
+                out = torch.cat([out, out_], 2)  # out: (B, 12, T_total, H*8, W*8)
+        out = unpatchify(out, patch_size=2)  # out: (B, 3, T_total, H*16, W*16)
         self.clear_cache()
-        return out
+        return out  # -> (B, 3, T, H, W)
 
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
@@ -1022,13 +1044,15 @@ class Wan2_2_VAE:
             ).eval().requires_grad_(False).to(device))
 
     def encode(self, videos):
+        # videos: list of (C, T, H, W) tensors - list of videos without batch dimension
+        # Returns: list of (z_dim, T', H', W') tensors - latent representations
         try:
             if not isinstance(videos, list):
                 raise TypeError("videos should be a list")
             with amp.autocast(dtype=self.dtype):
                 return [
-                    self.model.encode(u.unsqueeze(0),
-                                      self.scale).float().squeeze(0)
+                    self.model.encode(u.unsqueeze(0),  # u: (C, T, H, W) -> (1, C, T, H, W)
+                                      self.scale).float().squeeze(0)  # -> (z_dim, T', H', W')
                     for u in videos
                 ]
         except TypeError as e:
@@ -1036,14 +1060,16 @@ class Wan2_2_VAE:
             return None
 
     def decode(self, zs):
+        # zs: list of (z_dim, T', H', W') tensors - list of latent representations without batch dimension
+        # Returns: list of (C, T, H, W) tensors - reconstructed videos
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
             with amp.autocast(dtype=self.dtype):
                 return [
-                    self.model.decode(u.unsqueeze(0),
+                    self.model.decode(u.unsqueeze(0),  # u: (z_dim, T', H', W') -> (1, z_dim, T', H', W')
                                       self.scale).float().clamp_(-1,
-                                                                 1).squeeze(0)
+                                                                 1).squeeze(0)  # -> (C, T, H, W)
                     for u in zs
                 ]
         except TypeError as e:
